@@ -1,0 +1,14 @@
+{
+  "spans": 1290,
+  "rows": [
+    { "date": "2026-05-26", "provider": "anthropic", "model": "claude-sonnet-4", "spans": 820, "inputTokens": 1270000, "outputTokens": 470000, "costUSD": 5.5180, "currency": "USD" },
+    { "date": "2026-05-26", "provider": "openai", "model": "gpt-4o", "spans": 470, "inputTokens": 645000, "outputTokens": 218000, "costUSD": 4.2050, "currency": "USD" }
+  ],
+  "totals": {
+    "spans": 1290,
+    "inputTokens": 1915000,
+    "outputTokens": 688000,
+    "costUSD": 9.7230
+  },
+  "window": { "from": "2026-05-26T00:00:00Z", "to": "2026-05-26T23:59:59Z" }
+}

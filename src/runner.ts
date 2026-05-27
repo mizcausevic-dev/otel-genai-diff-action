@@ -1,0 +1,169 @@
+import { execSync } from "node:child_process";
+import { readFileSync, appendFileSync, existsSync } from "node:fs";
+
+import { diffRollups } from "./diff.js";
+import { toMarkdown } from "./format.js";
+import type { RollupReport, RollupDiff } from "./types.js";
+
+export interface RunnerEnv {
+  inputs: Record<string, string | undefined>;
+  GITHUB_OUTPUT?: string;
+  GITHUB_EVENT_NAME?: string;
+  GITHUB_REPOSITORY?: string;
+  GITHUB_EVENT_PATH?: string;
+  readFile?: (path: string) => string;
+  exists?: (path: string) => boolean;
+  gitShow?: (sha: string, path: string) => string | null;
+  postComment?: (args: { token: string; repo: string; issueNumber: number; body: string }) => Promise<void>;
+  write?: (line: string) => void;
+}
+
+export interface RunnerResult {
+  exitCode: 0 | 1;
+  diff: RollupDiff | null;
+  newReport: boolean;
+  commentPosted: boolean;
+  reason?: string;
+}
+
+const NULL_DIFF: RollupDiff = {
+  changes: [],
+  breaking: false,
+  added: { models: [], providers: [] },
+  removed: { models: [], providers: [] },
+  totals: {
+    previous: { spans: 0, inputTokens: 0, outputTokens: 0, costUSD: 0 },
+    next: { spans: 0, inputTokens: 0, outputTokens: 0, costUSD: 0 }
+  }
+};
+
+function defaultGitShow(sha: string, path: string): string | null {
+  try {
+    return execSync(`git show ${sha}:${path}`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  } catch {
+    return null;
+  }
+}
+
+export async function run(env: RunnerEnv): Promise<RunnerResult> {
+  const reportPath = required(env.inputs, "report_path");
+  const baseShaInput = env.inputs.base_sha ?? "";
+  const thresholdInput = env.inputs.threshold ?? "0.10";
+  const threshold = Number.parseFloat(thresholdInput);
+  if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+    throw new Error(`input "threshold" must be a finite number in [0,1] — got "${thresholdInput}"`);
+  }
+  const commentOnPr = env.inputs.comment_on_pr ?? "auto";
+  const failOnBreaking = (env.inputs.fail_on_breaking ?? "true").toLowerCase() !== "false";
+  const failOnAnyChange = (env.inputs.fail_on_any_change ?? "false").toLowerCase() === "true";
+  const token = env.inputs.github_token ?? "";
+
+  const read = env.readFile ?? ((p) => readFileSync(p, "utf8"));
+  const exists = env.exists ?? ((p) => existsSync(p));
+  const gitShow = env.gitShow ?? defaultGitShow;
+  const write = env.write ?? ((line) => process.stdout.write(`${line}\n`));
+
+  if (!exists(reportPath)) {
+    write(`::error::report-path "${reportPath}" does not exist on disk.`);
+    return { exitCode: 1, diff: null, newReport: false, commentPosted: false, reason: "report-path not found" };
+  }
+
+  let baseSha = baseShaInput;
+  if (!baseSha && env.GITHUB_EVENT_PATH && exists(env.GITHUB_EVENT_PATH)) {
+    try {
+      const event = JSON.parse(read(env.GITHUB_EVENT_PATH)) as { pull_request?: { base?: { sha?: string } } };
+      baseSha = event.pull_request?.base?.sha ?? "";
+    } catch {
+      // ignore
+    }
+  }
+
+  let prev: RollupReport | null = null;
+  let prevRaw: string | null = null;
+  if (baseSha) prevRaw = gitShow(baseSha, reportPath);
+  if (prevRaw !== null) {
+    try {
+      prev = JSON.parse(prevRaw) as RollupReport;
+    } catch (e) {
+      write(`::warning::could not parse previous RollupReport at ${baseSha}:${reportPath} — treating as new report. (${(e as Error).message})`);
+      prev = null;
+    }
+  }
+
+  const nextRaw = read(reportPath);
+  const next = JSON.parse(nextRaw) as RollupReport;
+
+  const newReport = prev === null;
+  const diff = newReport ? NULL_DIFF : diffRollups(prev as RollupReport, next, { threshold });
+  const markdown = newReport
+    ? `_New OTel GenAI rollup report at \`${reportPath}\` — no previous version found at base SHA ${baseSha || "(no base SHA)"}._`
+    : toMarkdown(diff);
+
+  const costDeltaUSD = newReport ? 0 : diff.totals.next.costUSD - diff.totals.previous.costUSD;
+  setOutput(env, "breaking", String(diff.breaking));
+  setOutput(env, "change-count", String(diff.changes.length));
+  setOutput(env, "new-report", String(newReport));
+  setOutput(env, "cost-delta-usd", costDeltaUSD.toFixed(6));
+
+  write(`\n${markdown}\n`);
+
+  const isPullRequest = env.GITHUB_EVENT_NAME === "pull_request";
+  const wantsComment = commentOnPr === "true" || (commentOnPr === "auto" && isPullRequest);
+  let commentPosted = false;
+  let reason: string | undefined;
+
+  if (wantsComment) {
+    if (!token) {
+      reason = "no github-token provided";
+    } else if (!env.GITHUB_EVENT_PATH) {
+      reason = "no GITHUB_EVENT_PATH";
+    } else if (!env.GITHUB_REPOSITORY) {
+      reason = "no GITHUB_REPOSITORY";
+    } else {
+      const event = JSON.parse(read(env.GITHUB_EVENT_PATH)) as { number?: number; pull_request?: { number?: number } };
+      const issueNumber = event.number ?? event.pull_request?.number;
+      if (!issueNumber) {
+        reason = "no PR number in event payload";
+      } else {
+        const body = `### OTel GenAI rollup diff — \`${reportPath}\`\n\n${markdown}\n\n_Generated by [otel-genai-diff-action](https://github.com/mizcausevic-dev/otel-genai-diff-action)._`;
+        const poster = env.postComment ?? defaultPostComment;
+        await poster({ token, repo: env.GITHUB_REPOSITORY, issueNumber, body });
+        commentPosted = true;
+      }
+    }
+  }
+
+  if (!newReport && failOnBreaking && diff.breaking) {
+    write(`::error::OTel GenAI rollup diff is BREAKING — ${diff.changes.length} change(s) detected, Δcost=$${costDeltaUSD.toFixed(4)}.`);
+    return { exitCode: 1, diff, newReport, commentPosted, reason };
+  }
+  if (!newReport && failOnAnyChange && diff.changes.length > 0) {
+    write(`::error::OTel GenAI rollup has ${diff.changes.length} change(s) and fail-on-any-change=true.`);
+    return { exitCode: 1, diff, newReport, commentPosted, reason };
+  }
+
+  return { exitCode: 0, diff, newReport, commentPosted, reason };
+}
+
+function required(inputs: Record<string, string | undefined>, name: string): string {
+  const v = inputs[name];
+  if (!v || v.length === 0) throw new Error(`input "${name}" is required`);
+  return v;
+}
+
+function setOutput(env: RunnerEnv, key: string, value: string): void {
+  if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `${key}=${value}\n`);
+}
+
+async function defaultPostComment(args: { token: string; repo: string; issueNumber: number; body: string }): Promise<void> {
+  const r = await fetch(`https://api.github.com/repos/${args.repo}/issues/${args.issueNumber}/comments`, {
+    method: "POST",
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${args.token}`,
+      "X-GitHub-Api-Version": "2022-11-28"
+    },
+    body: JSON.stringify({ body: args.body })
+  });
+  if (!r.ok) throw new Error(`GitHub API comment failed: ${r.status} ${await r.text()}`);
+}
