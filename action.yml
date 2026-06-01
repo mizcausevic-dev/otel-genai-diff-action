@@ -1,5 +1,5 @@
 name: "OTel GenAI Diff"
-description: "PR gate for OTel GenAI rollup report changes. Retrieves the previous version of the rollup report via `git show <base.sha>:<report-path>`, diffs against HEAD using otel-genai-diff, posts the structured diff as a PR comment, and fails the build on breaking cost / token jumps (default threshold 10%)."
+description: "PR gate for OTel GenAI rollup changes — diffs HEAD vs base, posts a comment, fails on cost/token jumps."
 author: "mizcausevic-dev"
 branding:
   icon: "git-pull-request"
